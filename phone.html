@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#111111"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="Photo Mirror">
+<link rel="manifest" href="manifest.json"><link rel="apple-touch-icon" href="icon.svg"><link rel="icon" href="icon.svg">
+<title>Photo Mirror</title>
+<meta name="pm-mode" content="p2p"><script src="pmp.js"></script><script src="p2p-phone.js"></script>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;min-height:100vh;min-height:100dvh;display:flex;flex-direction:column;align-items:center;justify-content:space-between;padding:max(28px,env(safe-area-inset-top)) 20px max(28px,env(safe-area-inset-bottom));font-family:system-ui,-apple-system,sans-serif;background:#111;color:#eee;text-align:center}
+h1{font-size:22px;margin:0 0 10px;display:flex;align-items:center;justify-content:center;gap:8px}
+#conn{display:inline-flex;align-items:center;gap:8px;font-size:15px;padding:6px 14px;border-radius:20px;background:#222}
+#conn:before{content:"";width:10px;height:10px;border-radius:50%;background:#ff5a5a;flex:none}
+#conn.ok:before{background:#3ddc6a}
+.mid{display:flex;flex-direction:column;align-items:center;gap:22px}
+#cam{width:190px;height:190px;border-radius:50%;background:#2b8a3e;display:flex;align-items:center;justify-content:center;box-shadow:0 0 0 12px #2b8a3e33;cursor:pointer;transition:transform .15s,box-shadow .2s}
+#cam:active{transform:scale(.94);box-shadow:0 0 0 18px #2b8a3e22}
+#cam:focus-within{outline:3px solid #3ddc6a;outline-offset:14px}
+#cam svg{width:84px;height:84px}
+#msg{font-size:18px;min-height:28px;color:#aaa;max-width:320px}
+.sec{display:block;width:min(100%,280px);margin-left:auto;margin-right:auto;color:#bbb;font-size:16px;padding:14px 22px;border:1px solid #333;border-radius:14px;background:#1a1a1a;cursor:pointer;margin-top:15px}
+.sec:active{background:#242424}.sec:focus-within{outline:2px solid #3ddc6a;outline-offset:3px}
+input{display:none}
+.by{font-size:12px;color:#777;line-height:1.5;margin-top:6px}.by a{color:#999;text-decoration:none}.by a:hover{text-decoration:underline}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div>
+<h1>📸 Photo Mirror Phone</h1>
+<div id="conn">Connecting to extension room...</div>
+</div>
+<div class="mid">
+<label id="cam" aria-label="Take a photo">
+<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
+<input id="f" type="file" accept="image/*" capture="environment">
+</label>
+<div id="msg" role="status" aria-live="polite">Tap the button to take a photo</div>
+</div>
+<div>
+<label class="sec">Choose from gallery<input id="g" type="file" accept="image/*" multiple></label>
+<label class="sec">Send a document or file<input id="d" type="file" multiple></label>
+<div class="by">&copy; 2026 Helekt AB &middot; <a href="https://www.helekt.net" target="_blank" rel="noopener">www.helekt.net</a></div>
+</div>
+<script>
+const $=id=>document.getElementById(id), f=$('f'), g=$('g'), msg=$('msg'), conn=$('conn');
+function setConn(ok,t){conn.className=ok?'ok':'';conn.textContent=t;}
+async function ping(){
+  try{const r=await fetch('/ping',{cache:'no-store'});
+    if(r.status===401){setConn(false,'Not paired: scan the QR code');return;}
+    if(!r.ok)throw 0;setConn(true,'Linked to Laptop Extension');
+  }catch(e){setConn(false,'Connection Offline');}
+}
+ping();setInterval(ping,6000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)ping();});
+/* lets the computer know a phone is connected */
+try{new EventSource('/phone-events');}catch(e){}
+
+/* shrink the photo, then send it */
+async function prepare(file){
+  const bmp=await createImageBitmap(file),s=Math.min(1,2400/Math.max(bmp.width,bmp.height)),c=document.createElement('canvas');
+  c.width=Math.round(bmp.width*s);c.height=Math.round(bmp.height*s);
+  c.getContext('2d').drawImage(bmp,0,0,c.width,c.height);
+  return new Promise(r=>c.toBlob(r,'image/jpeg',.88));
+}
+async function send(input){
+  const files=[...input.files];input.value='';
+  for(let i=0;i<files.length;i++){
+    msg.textContent=files.length>1?'Sending '+(i+1)+' of '+files.length+'...':'Sending...';
+    try{
+      const r=await fetch('/upload',{method:'POST',body:await prepare(files[i])});
+      if(r.status===401){msg.textContent='Not paired. Scan the QR code again.';return;}
+      if(!r.ok)throw 0;
+    }catch(e){msg.textContent='Could not send. Check your connection and try again.';return;}
+  }
+  msg.textContent='Sent ✓ Check your computer. Tap to take another.';
+  if(navigator.vibrate)navigator.vibrate(80);
+}
+f.onchange=()=>send(f);g.onchange=()=>send(g);
+
+/* documents and any other files go across as they are */
+function upFile(file,label){
+  return new Promise(res=>{
+    const x=new XMLHttpRequest();x.open('POST','/file-up?name='+encodeURIComponent(file.name));
+    x.upload.onprogress=e=>{if(e.lengthComputable)msg.textContent=label+' '+Math.round(e.loaded/e.total*100)+'%';};
+    x.onload=()=>res(x.status);x.onerror=()=>res(0);x.send(file);
+  });
+}
+$('d').onchange=async()=>{
+  const files=[...$('d').files];$('d').value='';
+  for(let i=0;i<files.length;i++){
+    const label=files.length>1?'Sending '+(i+1)+' of '+files.length+':':'Sending:';
+    msg.textContent=label+' '+files[i].name;
+    const st=await upFile(files[i],label);
+    if(st===401){msg.textContent='Not paired. Scan the QR code again.';return;}
+    if(st!==200){msg.textContent='Could not send '+files[i].name+'. Try again.';return;}
+  }
+  msg.textContent='Sent ✓ Check your computer. Tap to take another.';
+  if(navigator.vibrate)navigator.vibrate(80);
+};
+</script>
+</body>
+</html>

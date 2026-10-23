@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex">
+<title>Photo Mirror text reader</title>
+</head>
+<body>
+<!-- Text reader used by the Photo Mirror extension.
+     It runs inside a hidden frame. Your photo is read on your own computer, in this frame,
+     and is never uploaded anywhere. Only the reading engine and the language file are downloaded. -->
+<script>
+'use strict';
+var ENGINE = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
+var FROM_EXTENSION = /^(chrome-extension|moz-extension|safari-web-extension):\/\//;
+
+var BEST_DATA = 'https://tessdata.projectnaptha.com/4.0.0_best_int';
+var bestData = null;
+var engine = null, worker = null, workerLang = '';
+function loadEngine() {
+  if (engine) return engine;
+  engine = new Promise(function (res, rej) {
+    if (window.Tesseract) return res();
+    var s = document.createElement('script'); s.src = ENGINE; s.crossOrigin = 'anonymous';
+    s.onload = res; s.onerror = function () { engine = null; rej(new Error('engine')); };
+    document.head.appendChild(s);
+  });
+  return engine;
+}
+async function getWorker(lang) {
+  if (worker && workerLang === lang) return worker;
+  if (worker) { try { await worker.terminate(); } catch (e) {} worker = null; }
+  var w;
+  if (bestData !== false) {       /* the more accurate language files first, the standard ones if those cannot be fetched */
+    try { w = await Tesseract.createWorker(lang, 1, { langPath: BEST_DATA }); bestData = true; }
+    catch (e) { bestData = false; w = null; }
+  }
+  if (!w) w = await Tesseract.createWorker(lang, 1, {});
+  try { await w.setParameters({ preserve_interword_spaces: '1' }); } catch (e) {}
+  worker = w; workerLang = lang; return w;
+}
+/* Make the photo easier to read: even out uneven light and shadows, boost contrast, sharpen, straighten.
+   (Tested against phone-style photos: this reads far better than sending the raw photo.) */
+function areaDown(g, w, h, f) {
+  var sw = Math.max(8, Math.floor(w / f)), sh = Math.max(8, Math.floor(h / f)), o = new Float32Array(sw * sh), cnt = new Float32Array(sw * sh), x, y, i;
+  for (y = 0; y < h; y++) { var yy = Math.min(sh - 1, (y * sh / h) | 0); for (x = 0; x < w; x++) { i = yy * sw + Math.min(sw - 1, (x * sw / w) | 0); o[i] += g[y * w + x]; cnt[i]++; } }
+  for (i = 0; i < o.length; i++) o[i] = cnt[i] ? o[i] / cnt[i] : 255;
+  return { d: o, w: sw, h: sh };
+}
+function maxFilter(src, w, h, r) {            /* separable box maximum */
+  var t = new Float32Array(src.length), o = new Float32Array(src.length), x, y, k, m, h2 = r >> 1;
+  for (y = 0; y < h; y++) for (x = 0; x < w; x++) { m = 0; for (k = Math.max(0, x - h2); k <= Math.min(w - 1, x + h2); k++) if (src[y * w + k] > m) m = src[y * w + k]; t[y * w + x] = m; }
+  for (x = 0; x < w; x++) for (y = 0; y < h; y++) { m = 0; for (k = Math.max(0, y - h2); k <= Math.min(h - 1, y + h2); k++) if (t[k * w + x] > m) m = t[k * w + x]; o[y * w + x] = m; }
+  return o;
+}
+function blurSmall(src, w, h, sigma) {        /* separable gaussian */
+  var rad = Math.max(1, Math.ceil(sigma * 3)), ker = new Float32Array(rad * 2 + 1), sum = 0, i, x, y, k;
+  for (i = -rad; i <= rad; i++) { ker[i + rad] = Math.exp(-i * i / (2 * sigma * sigma)); sum += ker[i + rad]; }
+  for (i = 0; i < ker.length; i++) ker[i] /= sum;
+  var t = new Float32Array(src.length), o = new Float32Array(src.length), a, xx;
+  for (y = 0; y < h; y++) for (x = 0; x < w; x++) { a = 0; for (k = -rad; k <= rad; k++) { xx = Math.min(w - 1, Math.max(0, x + k)); a += src[y * w + xx] * ker[k + rad]; } t[y * w + x] = a; }
+  for (x = 0; x < w; x++) for (y = 0; y < h; y++) { a = 0; for (k = -rad; k <= rad; k++) { xx = Math.min(h - 1, Math.max(0, y + k)); a += t[xx * w + x] * ker[k + rad]; } o[y * w + x] = a; }
+  return o;
+}
+function flatField(g, w, h) {                  /* divide by the estimated paper brightness */
+  var sm = areaDown(g, w, h, 8), r = Math.max(3, Math.round(sm.w / 16)), bg = blurSmall(maxFilter(sm.d, sm.w, sm.h, r), sm.w, sm.h, r / 1.5), x, y, i = 0;
+  for (y = 0; y < h; y++) {
+    var fy = Math.min(sm.h - 1.001, Math.max(0, (y + .5) * sm.h / h - .5)), y0 = fy | 0, ty = fy - y0;
+    for (x = 0; x < w; x++, i++) {
+      var fx = Math.min(sm.w - 1.001, Math.max(0, (x + .5) * sm.w / w - .5)), x0 = fx | 0, tx = fx - x0, p = y0 * sm.w + x0;
+      var b = (bg[p] * (1 - tx) + bg[p + 1] * tx) * (1 - ty) + (bg[p + sm.w] * (1 - tx) + bg[p + sm.w + 1] * tx) * ty;
+      var v = g[i] / (b + 1) * 255; g[i] = v > 255 ? 255 : v;
+    }
+  }
+}
+function sharpen(g, w, h, amt) {
+  var sm = new Float32Array(g); var b = blurFull(sm, w, h), i, v;
+  for (i = 0; i < g.length; i++) { v = g[i] * (1 + amt) - b[i] * amt; g[i] = v < 0 ? 0 : v > 255 ? 255 : v; }
+}
+function blurFull(src, w, h) {                 /* cheap blur: 5-tap box, twice (about sigma 2) */
+  var t = new Float32Array(src.length), o = new Float32Array(src.length), x, y, k, a, n, pass;
+  var cur = src;
+  for (pass = 0; pass < 2; pass++) {
+    for (y = 0; y < h; y++) for (x = 0; x < w; x++) { a = 0; n = 0; for (k = -2; k <= 2; k++) { if (x + k >= 0 && x + k < w) { a += cur[y * w + x + k]; n++; } } t[y * w + x] = a / n; }
+    for (x = 0; x < w; x++) for (y = 0; y < h; y++) { a = 0; n = 0; for (k = -2; k <= 2; k++) { if (y + k >= 0 && y + k < h) { a += t[(y + k) * w + x]; n++; } } o[y * w + x] = a / n; }
+    cur = pass === 0 ? new Float32Array(o) : o;
+  }
+  return o;
+}
+function skewAngle(g, w, h) {                  /* find the small tilt that makes text lines most horizontal */
+  var f = 3, sw = Math.floor(w / f), sh = Math.floor(h / f), hist = new Uint32Array(256), x, y, i, v;
+  var s = new Uint8Array(sw * sh);
+  for (y = 0; y < sh; y++) for (x = 0; x < sw; x++) { v = g[(y * f + 1) * w + x * f + 1] | 0; s[y * sw + x] = v; hist[v]++; }
+  var tot = sw * sh, sumAll = 0, sumB = 0, wB = 0, best = -1, thr = 128;      /* Otsu */
+  for (i = 0; i < 256; i++) sumAll += i * hist[i];
+  for (i = 0; i < 256; i++) { wB += hist[i]; if (!wB) continue; var wF = tot - wB; if (!wF) break; sumB += i * hist[i]; var mB = sumB / wB, mF = (sumAll - sumB) / wF, bt = wB * wF * (mB - mF) * (mB - mF); if (bt > best) { best = bt; thr = i; } }
+  var px = [], py = [];
+  for (y = 0; y < sh; y++) for (x = 0; x < sw; x++) if (s[y * sw + x] <= thr) { px.push(x - sw / 2); py.push(y - sh / 2); }
+  if (px.length < 200 || px.length > tot * 0.5) return 0;
+  var diag = Math.ceil(Math.sqrt(sw * sw + sh * sh)) + 4;
+  function score(deg) {
+    var th = deg * Math.PI / 180, sn = Math.sin(th), cs = Math.cos(th), hh = new Float32Array(diag), k, yy;
+    for (k = 0; k < px.length; k++) { yy = (-px[k] * sn + py[k] * cs + diag / 2) | 0; if (yy >= 0 && yy < diag) hh[yy]++; }
+    var sc = 0; for (k = 1; k < diag; k++) { var d = hh[k] - hh[k - 1]; sc += d * d; } return sc;
+  }
+  var ba = 0, bs = -1, a, s0 = score(0);
+  for (a = -6; a <= 6.001; a += 0.5) { var sc = score(a); if (sc > bs) { bs = sc; ba = a; } }
+  for (a = ba - 0.4; a <= ba + 0.401; a += 0.1) { var sc2 = score(a); if (sc2 > bs) { bs = sc2; ba = a; } }
+  if (Math.abs(ba) < 0.3 || bs < s0 * 1.05) return 0;
+  return ba;
+}
+async function prepare(blob) {
+  var bmp = await createImageBitmap(blob), m = Math.max(bmp.width, bmp.height), k = 1;
+  if (m < 1800) k = Math.min(3, 1800 / m); else if (m > 3400) k = 3400 / m;
+  var w = Math.round(bmp.width * k), h = Math.round(bmp.height * k);
+  var c = document.createElement('canvas'); c.width = w; c.height = h;
+  var x = c.getContext('2d', { willReadFrequently: true }); x.imageSmoothingQuality = 'high'; x.drawImage(bmp, 0, 0, w, h);
+  var im = x.getImageData(0, 0, w, h), d = im.data, g = new Float32Array(w * h), i, v;
+  for (i = 0; i < g.length; i++) g[i] = (d[i * 4] * 299 + d[i * 4 + 1] * 587 + d[i * 4 + 2] * 114) / 1000;
+  flatField(g, w, h);
+  sharpen(g, w, h, 1.0);
+  var LO = 105, HI = 215;
+  for (i = 0; i < g.length; i++) { v = (g[i] - LO) * 255 / (HI - LO); v = v < 0 ? 0 : v > 255 ? 255 : v; g[i] = v; d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = v; d[i * 4 + 3] = 255; }
+  var ang = skewAngle(g, w, h);
+  x.putImageData(im, 0, 0);
+  if (ang) {
+    var c2 = document.createElement('canvas'); c2.width = w; c2.height = h;
+    var x2 = c2.getContext('2d'); x2.fillStyle = '#fff'; x2.fillRect(0, 0, w, h);
+    x2.translate(w / 2, h / 2); x2.rotate(-ang * Math.PI / 180); x2.imageSmoothingQuality = 'high'; x2.drawImage(c, -w / 2, -h / 2);
+    c = c2;
+  }
+  window.__lastAngle = ang;
+  return new Promise(function (r) { c.toBlob(r, 'image/png'); });
+}
+function rotateBlob(blob, deg) {
+  return createImageBitmap(blob).then(function (bmp) {
+    var c = document.createElement('canvas'), swap = deg === 90 || deg === 270;
+    c.width = swap ? bmp.height : bmp.width; c.height = swap ? bmp.width : bmp.height;
+    var x = c.getContext('2d'); x.translate(c.width / 2, c.height / 2); x.rotate(deg * Math.PI / 180); x.drawImage(bmp, -bmp.width / 2, -bmp.height / 2);
+    return new Promise(function (r) { c.toBlob(r, 'image/png'); });
+  });
+}
+/* read the photo; if the result looks poor, try a different layout mode and, for sideways or upside-down photos, the other rotations */
+async function readBest(w, img) {
+  var r = await w.recognize(img), best = r.data, conf = function (d) { return d && d.confidence ? d.confidence : 0; };
+  if (conf(best) < 55) {
+    try {
+      await w.setParameters({ tessedit_pageseg_mode: '6' });
+      var r2 = await w.recognize(img);
+      if (conf(r2.data) > conf(best) + 3) best = r2.data;
+    } catch (e) {} finally { try { await w.setParameters({ tessedit_pageseg_mode: '3' }); } catch (e) {} }
+  }
+  if (conf(best) < 40) {
+    for (var deg = 90; deg <= 270; deg += 90) {
+      try {
+        var r3 = await w.recognize(await rotateBlob(img, deg));
+        if (conf(r3.data) > conf(best) + 15) best = r3.data;
+      } catch (e) {}
+    }
+  }
+  return best;
+}
+var queue = Promise.resolve();
+addEventListener('message', function (e) {
+  if (!FROM_EXTENSION.test(e.origin)) return;
+  var d = e.data || {}; if (!d.id || !d.blob) return;
+  var reply = function (o) { o.id = d.id; try { e.source.postMessage(o, e.origin); } catch (x) {} };
+  queue = queue.then(async function () {
+    try {
+      var lang = /^[a-z_]{3,12}(\+[a-z_]{3,12}){0,3}$/.test(d.lang || '') ? d.lang : 'eng';
+      await loadEngine();
+      var img = await prepare(d.blob), w = await getWorker(lang), best = await readBest(w, img);
+      reply({ text: String(best.text || '').replace(/\r/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim(), note: '' });
+    } catch (err) {
+      reply({ text: '', error: err && err.message === 'engine' ? 'Text reading needs an internet connection the first time. Check your connection and try again.' : 'Could not read the text.' });
+    }
+  });
+});
+try { parent.postMessage({ ready: 1 }, '*'); } catch (e) {}
+</script>
+</body>
+</html>
